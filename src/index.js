@@ -36,10 +36,22 @@ function initSettings() {
         ...context.extensionSettings[EXTENSION_NAME],
     });
 
-    // Migrate old format (string paths) to new format (objects with path/description)
+    // Normalize invalid legacy settings before migrating string assignments.
     const settings = context.extensionSettings[EXTENSION_NAME];
+    for (const key of ['assignments', 'characterSettings']) {
+        if (!settings[key] || typeof settings[key] !== 'object' || Array.isArray(settings[key])) {
+            settings[key] = {};
+        }
+    }
+    if (!Array.isArray(settings.customPrompts)) settings.customPrompts = [];
+    // Migrate old format (string paths) to new format (objects with path/description)
     if (settings.assignments) {
         for (const charName of Object.keys(settings.assignments)) {
+            const assignments = settings.assignments[charName];
+            if (!assignments || typeof assignments !== 'object' || Array.isArray(assignments)) {
+                delete settings.assignments[charName];
+                continue;
+            }
             for (const imageName of Object.keys(settings.assignments[charName])) {
                 const value = settings.assignments[charName][imageName];
                 if (typeof value === 'string') {
@@ -69,6 +81,8 @@ function getSettings() {
 function saveSettings() {
     const context = SillyTavern.getContext();
     context.saveSettingsDebounced();
+    scheduleLocalImageRefresh();
+    updateFloatingPanel();
 }
 
 /**
@@ -160,7 +174,6 @@ function resolveEntityName(entityName) {
     // Try to use ST's built-in macro replacement
     if (context.substituteParams) {
         const resolved = context.substituteParams(entityName);
-        console.log(`[${EXTENSION_NAME}] resolveEntityName via ST: "${entityName}" -> "${resolved}"`);
         if (resolved !== entityName) {
             return resolved;
         }
@@ -195,7 +208,7 @@ function resolveEntityName(entityName) {
  */
 function getCharacterAssignments(charName) {
     const settings = getSettings();
-    return settings.assignments?.[charName] || {};
+    return Object.hasOwn(settings.assignments || {}, charName) ? settings.assignments[charName] : {};
 }
 
 /**
@@ -205,7 +218,8 @@ function getCharacterAssignments(charName) {
  */
 function getCharacterSettings(charName) {
     const settings = getSettings();
-    return settings.characterSettings?.[charName] || { injectPrompt: false, customPrefix: '' };
+    const map = settings.characterSettings || {};
+    return (Object.hasOwn(map, charName) && map[charName]) || { injectPrompt: false, selectedPromptId: 'default' };
 }
 
 /**
@@ -220,7 +234,7 @@ function saveCharacterSettings(charName, charSettings) {
     if (!settings.characterSettings) {
         settings.characterSettings = {};
     }
-    settings.characterSettings[charName] = charSettings;
+    Object.defineProperty(settings.characterSettings, charName, { value: charSettings, writable: true, enumerable: true, configurable: true });
     saveSettings();
 }
 
@@ -238,14 +252,13 @@ function assignImage(charName, imageName, imagePath, description = '') {
     if (!settings.assignments) {
         settings.assignments = {};
     }
-    if (!settings.assignments[charName]) {
-        settings.assignments[charName] = {};
+    if (!Object.hasOwn(settings.assignments, charName)) {
+        Object.defineProperty(settings.assignments, charName, { value: {}, writable: true, enumerable: true, configurable: true });
     }
 
-    settings.assignments[charName][imageName] = {
-        path: imagePath,
-        description: description
-    };
+    Object.defineProperty(settings.assignments[charName], imageName, {
+        value: { path: imagePath, description }, writable: true, enumerable: true, configurable: true,
+    });
     saveSettings();
     console.log(`[${EXTENSION_NAME}] Assigned "${imageName}" to "${imagePath}" for ${charName}`);
 }
@@ -290,10 +303,8 @@ function unassignImage(charName, imageName) {
  */
 function getImagePath(charName, imageName) {
     const assignments = getCharacterAssignments(charName);
-    console.log(`[${EXTENSION_NAME}] getImagePath - looking for entity="${charName}", image="${imageName}", assignments:`, Object.keys(assignments));
-    const assignment = assignments[imageName];
+    const assignment = Object.hasOwn(assignments, imageName) ? assignments[imageName] : null;
     if (!assignment) {
-        console.log(`[${EXTENSION_NAME}] getImagePath - image "${imageName}" not found for "${charName}"`);
         return '';
     }
     // Handle both old format (string) and new format (object)
@@ -332,7 +343,7 @@ function addCustomPrompt(name, template) {
         settings.customPrompts = [];
     }
 
-    const id = 'prompt_' + Date.now();
+    const id = 'prompt_' + crypto.randomUUID();
     settings.customPrompts.push({ id, name, template });
     saveSettings();
     return id;
@@ -400,7 +411,7 @@ function generateImageListPrompt(charName) {
 
     const lines = imageNames.map(name => {
         const assignment = assignments[name];
-        const desc = typeof assignment === 'object' ? assignment.description : '';
+        const desc = assignment && typeof assignment === 'object' ? assignment.description : '';
         return desc ? `- ${name}: ${desc}` : `- ${name}`;
     });
 
@@ -413,178 +424,204 @@ function generateImageListPrompt(charName) {
     return `[${prefix}\n${lines.join('\n')}]`;
 }
 
-/**
- * Replace ::img EntityName imagename:: tags in text with actual images
- * Entity names can have spaces - imagename is the last word (no spaces allowed in imagename)
- * @param {string} text - Text to process
- * @returns {string} Text with image tags replaced
- */
-function replaceImageTags(text) {
-    if (!text) return text;
-
-    // Match ::img ... :: pattern, then split to get entity (all but last word) and imagename (last word)
-    const pattern = /::img\s+(.+?)::/gi;
-
-    return text.replace(pattern, (match, content) => {
-        const trimmed = content.trim();
-        const lastSpace = trimmed.lastIndexOf(' ');
-        if (lastSpace === -1) return match; // Need at least entity + imagename
-
-        const entityName = resolveEntityName(trimmed.substring(0, lastSpace).trim());
-        const imageName = trimmed.substring(lastSpace + 1).trim();
-
-        const imagePath = getImagePath(entityName, imageName);
-        if (imagePath) {
-            return `![${imageName}](/${imagePath})`;
-        }
-        // If not found, try current character
-        const currentChar = getCurrentCharacterName();
-        if (currentChar) {
-            const currentPath = getImagePath(currentChar, imageName);
-            if (currentPath) {
-                return `![${imageName}](/${currentPath})`;
-            }
-        }
-        return match; // Leave unchanged if not found
-    });
-}
-
-/**
- * Strip ::img:: tags from text (for hiding from AI)
- * @param {string} text - Text to process
- * @returns {string} Text with image tags removed
- */
+/** Remove image commands without altering paragraphs, indentation or spacing. */
 function stripImageTags(text) {
-    if (!text) return text;
-    // Match ::img ... :: pattern and remove entirely
-    return text.replace(/::img\s+.+?::/gi, '').replace(/\s{2,}/g, ' ').trim();
+    if (typeof text !== 'string') return text;
+    return text.replace(/::img[ \t]+([^\r\n]*?)::/gi, '');
 }
 
-// Track processed messages to avoid reprocessing
-const processedMessages = new WeakSet();
+const localImageTagPattern = /::img[ \t]+([^\r\n]*?)::/gi;
+const localImageNodeState = new WeakMap();
+const localImageTimers = new Map();
+let localImageObserver = null;
+let localImageChatContainer = null;
 
-/**
- * Process a single message element in the DOM
- */
+function scheduleLocalImageRefresh(delay = 100) {
+    if (localImageTimers.has(delay)) clearTimeout(localImageTimers.get(delay));
+    localImageTimers.set(delay, setTimeout(() => {
+        localImageTimers.delete(delay);
+        processAllMessages();
+    }, delay));
+}
+
+function scheduleLocalImageFinalRefresh() {
+    // Events can precede the final DOM update. The observer also handles later updates.
+    for (const delay of [0, 100, 500]) scheduleLocalImageRefresh(delay);
+}
+
+function resolveLocalImage(content, message) {
+    const parts = content.trim().match(/^(.+?)\s+(\S+)$/);
+    if (!parts) return null;
+    let entity = parts[1].trim();
+    const name = parts[2];
+    // In a group, {{char}} refers to the speaker of this message.
+    if (/^(?:\{\{char\}\}|char)$/i.test(entity) && !message.is_user && message.name) {
+        entity = message.name;
+    } else {
+        entity = resolveEntityName(entity);
+    }
+    let path = getImagePath(entity, name);
+    if (!path && !message.is_user && message.name) path = getImagePath(message.name, name);
+    if (!path) {
+        const current = getCurrentCharacterName();
+        if (current) path = getImagePath(current, name);
+    }
+    if (!path) {
+        const persona = getCurrentPersonaName();
+        if (persona) path = getImagePath(persona, name);
+    }
+    if (typeof path !== 'string' || !path.trim()) return null;
+    path = path.trim();
+    // Assignments contain local server paths. Never interpret a URL or protocol as a path.
+    if (/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(path) || /[\r\n\0]/.test(path)) return null;
+    return { name, src: '/' + path.replace(/^\/+/, '') };
+}
+
+function createLocalImage(command, image) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'localimage-command';
+    const img = document.createElement('img');
+    img.src = image.src;
+    img.alt = image.name;
+    img.className = 'localimage-inserted';
+    img.loading = 'lazy';
+    img.style.cssText = 'max-width: 100%; border-radius: 8px; margin: 5px 0; display: block;';
+    wrapper.appendChild(img);
+    localImageNodeState.set(wrapper, { command, src: image.src, name: image.name });
+    return wrapper;
+}
+
 function processMessageElement(mesElement) {
-    // Skip if already processed
-    if (processedMessages.has(mesElement)) return;
+    const mesText = mesElement.querySelector('.mes_text');
+    const id = mesElement.getAttribute('mesid');
+    if (!mesText || id === null || !/^\d+$/.test(id)) return;
+    // Leave the message editor, code examples and other interactive UI alone.
+    if (mesElement.querySelector('.mes_edit_textarea') || mesText.isContentEditable) return;
+    const message = SillyTavern.getContext().chat?.[Number(id)];
+    if (!message) return;
+    const enabled = getSettings().enabled !== false;
 
-    // Try to find the content - check for STLE wrapper first
-    let mesText = mesElement.querySelector('.mes_text .stle--content') || mesElement.querySelector('.mes_text');
-    if (!mesText) return;
-
-    const text = mesText.textContent || '';
-
-    // Match ::img ... :: pattern, then split to get entity (all but last word) and imagename (last word)
-    const pattern = /::img\s+(.+?)::/gi;
-
-    let match;
-    const matches = [];
-    while ((match = pattern.exec(text)) !== null) {
-        const trimmed = match[1].trim();
-        const lastSpace = trimmed.lastIndexOf(' ');
-        if (lastSpace === -1) continue; // Need at least entity + imagename
-
-        matches.push({
-            full: match[0],
-            charName: trimmed.substring(0, lastSpace).trim(),
-            imageName: trimmed.substring(lastSpace + 1).trim()
-        });
+    // Reconcile our own images if assignments/settings changed. A swipe normally
+    // removes these nodes when ST renders the new message, so no signature cache is needed.
+    for (const wrapper of mesText.querySelectorAll('.localimage-command')) {
+        const state = localImageNodeState.get(wrapper);
+        if (!state) continue; // Do not modify an unrelated element with the same class.
+        const match = [...state.command.matchAll(localImageTagPattern)][0];
+        const image = enabled && match ? resolveLocalImage(match[1], message) : null;
+        if (!image) {
+            wrapper.replaceWith(document.createTextNode(state.command));
+        } else if (state.src !== image.src || state.name !== image.name || !wrapper.querySelector('img')) {
+            wrapper.replaceWith(createLocalImage(state.command, image));
+        }
     }
+    if (!enabled) return;
 
-    if (matches.length === 0) return;
-
-    // Mark as processed BEFORE making changes
-    processedMessages.add(mesElement);
-
-    console.log(`[${EXTENSION_NAME}] Found ${matches.length} localimage tag(s) in message`);
-
-    // Process each match - use textContent replacement to avoid HTML issues
-    matches.forEach(m => {
-        // Resolve entity name (handles {{user}}, {{char}} macros)
-        const resolvedName = resolveEntityName(m.charName);
-        console.log(`[${EXTENSION_NAME}] Processing tag: entity="${m.charName}" -> "${resolvedName}", name="${m.imageName}"`);
-
-        let imagePath = getImagePath(resolvedName, m.imageName);
-
-        // Fallback: try current character if not found
-        if (!imagePath) {
-            const currentChar = getCurrentCharacterName();
-            if (currentChar && currentChar !== resolvedName) {
-                imagePath = getImagePath(currentChar, m.imageName);
-            }
+    // Read contiguous visible text even when native formatting splits a command
+    // across several inline nodes. Block boundaries and code/UI stay separate.
+    for (const run of collectLocalImageTextRuns(mesText)) {
+        const text = run.map(node => node.nodeValue).join('');
+        const segments = [];
+        let offset = 0;
+        for (const node of run) {
+            segments.push({ node, start: offset, end: offset + node.nodeValue.length });
+            offset += node.nodeValue.length;
         }
-
-        // Fallback: try current persona if not found
-        if (!imagePath) {
-            const currentPersona = getCurrentPersonaName();
-            if (currentPersona && currentPersona !== resolvedName) {
-                imagePath = getImagePath(currentPersona, m.imageName);
+        // Work backwards so earlier offsets still refer to the same text.
+        for (const match of [...text.matchAll(localImageTagPattern)].reverse()) {
+            const image = resolveLocalImage(match[1], message);
+            if (!image) continue;
+            const start = match.index;
+            const end = start + match[0].length;
+            const covered = segments.filter(part => part.end > start && part.start < end);
+            if (!covered.length) continue;
+            const first = covered[0];
+            const last = covered[covered.length - 1];
+            const startOffset = start - first.start;
+            const endOffset = end - last.start;
+            const prefix = first.node.nodeValue.slice(0, startOffset);
+            const insertions = [createLocalImage(match[0], image)];
+            if (first === last) {
+                insertions.push(document.createTextNode(first.node.nodeValue.slice(endOffset)));
+            } else {
+                for (const part of covered.slice(1, -1)) part.node.nodeValue = '';
+                last.node.nodeValue = last.node.nodeValue.slice(endOffset);
             }
+            // Keep the original start node as the prefix: offsets for earlier
+            // commands within this same text node remain valid.
+            first.node.nodeValue = prefix;
+            // Insert immediately after the prefix without replacing its ancestors.
+            first.node.after(...insertions);
         }
+    }
+}
 
-        if (imagePath) {
-            const imgHtml = `<img src="/${imagePath}" alt="${m.imageName}" class="localimage-inserted" style="max-width: 100%; border-radius: 8px; margin: 5px 0; display: block;">`;
-
-            // Get message ID from the element
-            const mesId = mesElement.getAttribute('mesid');
-
-            // Update ST's chat data directly so STLE renders our change
-            const context = SillyTavern.getContext();
-            if (context.chat && mesId !== null) {
-                const msgIndex = parseInt(mesId);
-                if (context.chat[msgIndex]) {
-                    const originalMes = context.chat[msgIndex].mes;
-                    const newMes = originalMes.replace(m.full, imgHtml);
-                    if (newMes !== originalMes) {
-                        context.chat[msgIndex].mes = newMes;
-
-                        // Force re-render of this message
-                        const mesTextEl = mesElement.querySelector('.mes_text');
-                        if (mesTextEl) {
-                            mesTextEl.innerHTML = newMes;
-                        }
-                    }
-                }
-            }
-
-            // Also try direct DOM replacement as fallback
-            const paragraphs = mesText.querySelectorAll('p');
-            for (const p of paragraphs) {
-                const pText = p.textContent || '';
-                if (pText.includes(m.full)) {
-                    p.innerHTML = imgHtml;
-                    break;
-                }
-            }
+function collectLocalImageTextRuns(root) {
+    const runs = [];
+    let run = [];
+    const flush = () => {
+        if (run.length) runs.push(run);
+        run = [];
+    };
+    const excluded = 'code, pre, a, script, style, textarea, button, .localimage-command, [contenteditable="true"]';
+    const blocks = new Set(['P', 'DIV', 'BR', 'HR', 'BLOCKQUOTE', 'LI', 'UL', 'OL',
+        'TABLE', 'TR', 'TD', 'TH', 'SECTION', 'ARTICLE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+    const visit = node => {
+        if (node.nodeType === Node.TEXT_NODE) {
+            run.push(node);
+            return;
         }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.matches(excluded) || node.tagName === 'IMG') {
+            flush();
+            return;
+        }
+        const block = blocks.has(node.tagName);
+        if (block) flush();
+        for (const child of node.childNodes) visit(child);
+        if (block) flush();
+    };
+    for (const child of root.childNodes) visit(child);
+    flush();
+    return runs;
+}
+
+function observeLocalImageChat() {
+    const chat = document.getElementById('chat');
+    if (chat === localImageChatContainer) return;
+    localImageObserver?.disconnect();
+    localImageChatContainer = chat;
+    if (!chat) return;
+    localImageObserver ??= new MutationObserver(() => {
+        scheduleLocalImageRefresh();
     });
+    localImageObserver.observe(chat, { childList: true, subtree: true, characterData: true });
+    scheduleLocalImageRefresh();
 }
 
-/**
- * Process all messages in the chat
- */
 function processAllMessages() {
-    const messages = document.querySelectorAll('#chat .mes');
-    messages.forEach(processMessageElement);
+    observeLocalImageChat();
+    // Disconnect during our changes so they cannot schedule an observer feedback loop.
+    localImageObserver?.disconnect();
+    try {
+        for (const element of document.querySelectorAll('#chat .mes')) {
+            try {
+                processMessageElement(element);
+            } catch (error) {
+                console.error(`[${EXTENSION_NAME}] Could not process message`, error);
+            }
+        }
+    } finally {
+        if (localImageChatContainer?.isConnected) {
+            localImageObserver?.observe(localImageChatContainer, {
+                childList: true, subtree: true, characterData: true,
+            });
+        }
+    }
 }
 
-/**
- * Register message handler (no MutationObserver to avoid conflicts)
- */
 function registerMessageHandler() {
-    const chatElement = document.getElementById('chat');
-    if (!chatElement) {
-        console.warn(`[${EXTENSION_NAME}] Chat element not found, retrying...`);
-        setTimeout(registerMessageHandler, 1000);
-        return;
-    }
-
-    // Process existing messages on load
-    setTimeout(processAllMessages, 500);
-
-    console.log(`[${EXTENSION_NAME}] Message handler registered`);
+    observeLocalImageChat();
+    scheduleLocalImageFinalRefresh();
 }
 
 
@@ -1081,7 +1118,9 @@ function createFloatingPanel() {
         label.className = 'floating-panel-label';
         label.textContent = entity.name;
         if (entity.type === 'persona') {
-            label.innerHTML += ' <small>(you)</small>';
+            const suffix = document.createElement('small');
+            suffix.textContent = ' (you)';
+            label.appendChild(suffix);
         }
         row.appendChild(label);
 
@@ -1152,6 +1191,8 @@ function updateFloatingPanel() {
  * Initialize the extension
  */
 function init() {
+    document.documentElement?.setAttribute('data-localimage-patch', 'v9');
+    console.log(`[${EXTENSION_NAME}] Loaded patch v9 (native formatting preserved)`);
     initSettings();
     registerMessageHandler();
 
@@ -1162,6 +1203,7 @@ function init() {
     if (context.eventSource && context.eventTypes) {
         // Regular chat changed
         context.eventSource.on(context.eventTypes.CHAT_CHANGED, () => {
+            observeLocalImageChat();
             const ctx = SillyTavern.getContext();
             console.log(`[${EXTENSION_NAME}] CHAT_CHANGED event received - groupId: ${ctx.groupId}, characterId: ${ctx.characterId}`);
             onChatChanged();
@@ -1191,54 +1233,19 @@ function init() {
 
         console.log(`[${EXTENSION_NAME}] Event subscriptions registered`);
 
-        // Also listen for message rendered events
-        if (context.eventTypes.MESSAGE_RENDERED) {
-            context.eventSource.on(context.eventTypes.MESSAGE_RENDERED, (messageId) => {
-                console.log(`[${EXTENSION_NAME}] MESSAGE_RENDERED event for message ${messageId}`);
-                setTimeout(() => {
-                    const mesElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-                    if (mesElement) {
-                        processMessageElement(mesElement);
-                    }
-                }, 100);
-            });
+        // DOM-only insertion is safe after each native render. Do not gate it on
+        // generation events: dry runs/aborts may emit STARTED without an end event.
+        const refreshAfterRender = () => scheduleLocalImageFinalRefresh();
+        for (const eventName of [
+            'MESSAGE_RENDERED', 'USER_MESSAGE_RENDERED',
+            'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_SWIPED',
+            'MESSAGE_UPDATED', 'MESSAGE_EDITED', 'MORE_MESSAGES_LOADED', 'MESSAGE_DELETED',
+            'GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED',
+        ]) {
+            if (context.eventTypes[eventName]) {
+                context.eventSource.on(context.eventTypes[eventName], refreshAfterRender);
+            }
         }
-
-        // Listen for user message events - use longer delay to let other extensions finish
-        if (context.eventTypes.USER_MESSAGE_RENDERED) {
-            context.eventSource.on(context.eventTypes.USER_MESSAGE_RENDERED, (messageId) => {
-                console.log(`[${EXTENSION_NAME}] USER_MESSAGE_RENDERED event for message ${messageId}`);
-                // Use multiple delays to catch after STLE finishes
-                setTimeout(() => {
-                    const mesElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-                    if (mesElement) {
-                        processMessageElement(mesElement);
-                    }
-                }, 1000);
-                // Also try again after 2 seconds in case STLE re-renders
-                setTimeout(() => {
-                    const mesElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-                    if (mesElement && !mesElement.querySelector('.localimage-inserted')) {
-                        processedMessages.delete(mesElement);
-                        processMessageElement(mesElement);
-                    }
-                }, 2000);
-            });
-        }
-
-        // Listen for character message events
-        if (context.eventTypes.CHARACTER_MESSAGE_RENDERED) {
-            context.eventSource.on(context.eventTypes.CHARACTER_MESSAGE_RENDERED, (messageId) => {
-                console.log(`[${EXTENSION_NAME}] CHARACTER_MESSAGE_RENDERED event for message ${messageId}`);
-                setTimeout(() => {
-                    const mesElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-                    if (mesElement) {
-                        processMessageElement(mesElement);
-                    }
-                }, 500);
-            });
-        }
-
         // Listen for prompt generation to inject image list
         if (context.eventTypes.GENERATE_BEFORE_COMBINE_PROMPTS) {
             context.eventSource.on(context.eventTypes.GENERATE_BEFORE_COMBINE_PROMPTS, () => {
@@ -1276,33 +1283,36 @@ function init() {
                     }
                 }
 
-                if (prompts.length === 0) return;
-
-                // Inject into extension prompt (Author's Note style)
-                const combinedPrompt = prompts.join('\n\n');
-                const extensionPrompt = context.extensionPrompts?.['LocalImage'];
-                if (extensionPrompt === undefined) {
-                    // Register our extension prompt
-                    context.setExtensionPrompt(EXTENSION_NAME, combinedPrompt, 1, 0); // position 1 = after main prompt, depth 0
+                const persona = getCurrentPersonaName();
+                if (persona && getCharacterSettings(persona).injectPrompt) {
+                    const personaPrompt = generateImageListPrompt(persona);
+                    if (personaPrompt && !prompts.includes(personaPrompt)) prompts.push(personaPrompt);
                 }
+
+                // Always update or clear the same key; never carry a previous chat's list.
+                const combinedPrompt = getSettings().enabled !== false ? prompts.join('\n\n') : '';
+                SillyTavern.getContext().setExtensionPrompt(EXTENSION_NAME, combinedPrompt, 1, 0);
             });
         }
 
         // Strip ::img:: tags from chat messages before sending to AI
-        // This ensures tags are hidden from the AI while still rendering in the UI
+        // Preserve system instructions describing how to use the commands.
         if (context.eventTypes.CHAT_COMPLETION_PROMPT_READY) {
             context.eventSource.on(context.eventTypes.CHAT_COMPLETION_PROMPT_READY, (data) => {
-                if (!data || !data.messages) return;
+                if (getSettings().enabled === false || !Array.isArray(data?.messages)) return;
 
-                // Strip ::img:: tags from all message content
+                // Strip commands from conversation content, preserving prompt instructions.
                 for (const message of data.messages) {
-                    if (message.content && typeof message.content === 'string') {
+                    if (!message || typeof message !== 'object') continue;
+                    // System/developer instructions contain the image command usage examples.
+                    if (message.role === 'system' || message.role === 'developer') continue;
+                    if (typeof message.content === 'string') {
                         message.content = stripImageTags(message.content);
                     }
                     // Handle array content (for multimodal messages)
                     if (Array.isArray(message.content)) {
                         for (const part of message.content) {
-                            if (part.type === 'text' && part.text) {
+                            if (part?.type === 'text' && typeof part.text === 'string') {
                                 part.text = stripImageTags(part.text);
                             }
                         }
@@ -1329,6 +1339,7 @@ function init() {
 
     const checkAndUpdateButton = () => {
         try {
+            observeLocalImageChat();
             const context = SillyTavern.getContext();
             const currentGroupId = context.groupId;
             const currentCharacterId = context.characterId;
@@ -1342,7 +1353,7 @@ function init() {
             } else {
                 // Also check if button is missing
                 const existingButton = document.getElementById(BUTTON_ID);
-                if (!existingButton) {
+                if (!existingButton && !isGroupChat() && getCurrentCharacterName()) {
                     const chatElement = document.getElementById('chat');
                     if (chatElement && chatElement.children.length > 0) {
                         console.log(`[${EXTENSION_NAME}] Button missing, re-adding`);
@@ -1359,21 +1370,21 @@ function init() {
     console.log(`[${EXTENSION_NAME}] Setting up polling and observers`);
     setTimeout(checkAndUpdateButton, 500);
 
-    const chatObserver = new MutationObserver((mutations) => {
+    const chatObserver = new MutationObserver(() => {
         checkAndUpdateButton();
     });
 
     // Observe the chat container for changes
     const chatContainer = document.getElementById('chat');
     if (chatContainer) {
-        chatObserver.observe(chatContainer, { childList: true, subtree: false });
+        chatObserver.observe(chatContainer, { childList: true });
         console.log(`[${EXTENSION_NAME}] MutationObserver watching chat container`);
     }
 
     // Also observe the sheld container which changes when switching chat types
     const sheldContainer = document.getElementById('sheld');
     if (sheldContainer) {
-        chatObserver.observe(sheldContainer, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        chatObserver.observe(sheldContainer, { childList: true, attributes: true, attributeFilter: ['class'] });
         console.log(`[${EXTENSION_NAME}] MutationObserver watching sheld container`);
     }
 
@@ -1382,14 +1393,14 @@ function init() {
         if (!chatContainer) {
             const delayedChat = document.getElementById('chat');
             if (delayedChat) {
-                chatObserver.observe(delayedChat, { childList: true, subtree: false });
+                chatObserver.observe(delayedChat, { childList: true });
                 console.log(`[${EXTENSION_NAME}] MutationObserver watching chat container (delayed)`);
             }
         }
         if (!sheldContainer) {
             const delayedSheld = document.getElementById('sheld');
             if (delayedSheld) {
-                chatObserver.observe(delayedSheld, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+                chatObserver.observe(delayedSheld, { childList: true, attributes: true, attributeFilter: ['class'] });
                 console.log(`[${EXTENSION_NAME}] MutationObserver watching sheld container (delayed)`);
             }
         }

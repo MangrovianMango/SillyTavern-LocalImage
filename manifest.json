@@ -3,10 +3,10 @@
     "loading_order": 1,
     "requires": [],
     "optional": [],
-    "js": "dist/index.v3.js",
+    "js": "dist/index.localimage-v9.js",
     "css": "style.css",
     "author": "mechamarmot",
-    "version": "1.6.0",
+    "version": "1.6.0-localimage.9",
     "homePage": "https://github.com/mechamarmot/SillyTavern-LocalImage",
     "auto_update": true
 }

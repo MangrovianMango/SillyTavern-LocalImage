@@ -5,7 +5,7 @@ module.exports = {
     entry: path.join(__dirname, 'src/index.js'),
     output: {
         path: path.join(__dirname, 'dist/'),
-        filename: `index.v3.js`,
+        filename: `index.localimage-v9.js`,
     },
     module: {
         rules: [
